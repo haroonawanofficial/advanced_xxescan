@@ -14,6 +14,7 @@ This script is designed to scan a specified domain for XXE (XML External Entity)
 - **HTML Escaping**: Properly escapes HTML characters in the payloads, responses, and URLs to ensure the report does not break.
 - **Detailed Logging**: Provides detailed logging for debugging and tracking the script's progress.
 - **HTML Report Generation**: Generates a detailed HTML report with the status (Vulnerable/Not Vulnerable) for each tested URL.
+- **Obfuscation**: Includes various obfuscation techniques to evade detection by security mechanisms, increasing the likelihood of finding vulnerabilities.
 
 ## How It Works
 
