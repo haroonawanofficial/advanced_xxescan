@@ -37,7 +37,7 @@ from time import perf_counter
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 
 # Load local CodeBERT model for scoring
-logging.info("[AI] Loading local CodeBERT model...")
+logging.info("[AI] Loading AI...")
 tokenizer = AutoTokenizer.from_pretrained("microsoft/codebert-base")
 model = AutoModelForSequenceClassification.from_pretrained("microsoft/codebert-base")
 model.eval()
@@ -214,4 +214,3 @@ if __name__ == '__main__':
         generate_report(conn)
     conn.close()
     logging.info("[Done] Local AI XXE scan complete.")
-
