@@ -1,4 +1,4 @@
-# Advanced XXE Scan Script
+# AI-Powered XXE Fuzzer for 0 Day Discovery
 
 ## Description
 
